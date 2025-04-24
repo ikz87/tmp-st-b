@@ -1,5 +1,6 @@
 generator client {
   provider = "prisma-client-py"
+  # interface = "asyncio" # Enable if using async Prisma client
 }
 
 datasource db {
@@ -8,8 +9,12 @@ datasource db {
 }
 
 model User {
-  id    String @id @default(uuid())
-  email String @unique
-  name  String
-  password String
+  id        String  @id @default(uuid())
+  email     String  @unique
+  name      String? // Make optional if name might not always be present
+  auth0_sub String? @unique // Auth0 User ID (subject), make unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  // Remove password if using only Auth0
+  // password String
 }
