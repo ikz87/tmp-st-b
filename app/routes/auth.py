@@ -3,14 +3,17 @@ import secrets
 import hashlib
 import base64
 from urllib.parse import urlencode
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends, Form, status # Added Form, status
 from fastapi.responses import RedirectResponse
 from jose import jwt, JWTError
-from jose.utils import base64url_decode
+# from jose.utils import base64url_decode # Not used in current code, can remove if not needed elsewhere
+from pydantic import EmailStr # Added for email validation
 from app.config import settings
-from app.dependencies import get_optional_current_user # Use optional for login/callback
+from app.dependencies import get_optional_current_user, get_current_user # Added get_current_user
 
+# --- Create the router FIRST ---
 auth_router = APIRouter()
+# -----------------------------
 
 # In-memory cache for JWKS (in production, consider a more robust cache like Redis)
 jwks_cache = None
@@ -73,11 +76,130 @@ async def validate_token(token: str):
         raise HTTPException(status_code=500, detail="Error validating token")
 
 
+# --- ROPG Endpoint ---
+@auth_router.post("/token-login")
+async def token_login(
+    request: Request,
+    email: EmailStr = Form(...),
+    password: str = Form(...)
+):
+    """
+    Handles login via email/password directly using ROPG.
+    **WARNING: This flow has security implications and bypasses Universal Login features.**
+    """
+    token_url = f"https://{settings.AUTH0_DOMAIN}/oauth/token"
+    token_payload = {
+        "grant_type": "password", # Use Resource Owner Password Grant
+        "client_id": settings.AUTH0_CLIENT_ID,
+        "client_secret": settings.AUTH0_CLIENT_SECRET, # Required for ROPG unless using private_key_jwt
+        "username": email, # Auth0 uses 'username' field for email in ROPG
+        "password": password,
+        "audience": settings.AUTH0_AUDIENCE,
+        "realm": "Username-Password-Authentication",
+        "scope": "openid profile email offline_access", # Request necessary scopes
+    }
+
+    
+    async with httpx.AsyncClient() as client:
+        token_response = None # Initialize outside try
+        try:
+            token_response = await client.post(token_url, data=token_payload)
+
+            # Check for specific ROPG errors *before* raise_for_status
+            if token_response.status_code in [401, 403]:
+                 error_detail = "Invalid email or password."
+                 try:
+                     error_data = token_response.json()
+                     if error_data.get("error") == "invalid_grant":
+                         error_detail = "Invalid email or password."
+                     elif error_data.get("error_description"):
+                          print(f"Auth0 ROPG Error Desc: {error_data.get('error_description')}")
+                          # Avoid reflecting detailed Auth0 errors directly to frontend usually
+                          # error_detail = error_data.get('error_description')
+                 except Exception:
+                     pass # Ignore JSON parsing errors if body isn't JSON
+                 # Raise the specific 401 error
+                 raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=error_detail
+                 )
+
+            # Raise exceptions for other non-2xx responses (400, 404, 5xx etc.)
+            token_response.raise_for_status()
+            token_data = token_response.json()
+
+        # Catch specific HTTP errors from httpx *after* handling 401/403
+        except httpx.HTTPStatusError as e:
+            # This will now catch errors other than the 401/403 we handled above
+            print(f"Token exchange failed (ROPG): {e.response.status_code} - {e.response.text if e.response else 'No response text'}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Login failed during token exchange.")
+
+        # Catch ONLY unexpected errors (network issues, programming errors)
+        # DO NOT catch HTTPException here, let it propagate
+        except Exception as e:
+            # Check if it's an HTTPException we already raised, if so, re-raise it
+            if isinstance(e, HTTPException):
+                raise e
+            # Otherwise, it's an unexpected internal error
+            print(f"Unexpected error during token exchange (ROPG): {type(e).__name__} - {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error during login.")
+
+
+    id_token = token_data.get("id_token")
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+
+    if not id_token:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="ID token not found in Auth0 response.")
+
+    # Validate the ID token (same function as before)
+    try:
+        user_profile = await validate_token(id_token)
+    except HTTPException as e:
+        raise e # Re-raise validation errors
+    except Exception as e:
+        print(f"Unexpected error during token validation (ROPG): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to validate token after login.")
+
+    # --- User Persistence (Optional but Recommended - Same as callback) ---
+    # Example (requires Prisma setup):
+    # from app.prisma import db # Make sure prisma client is initialized
+    # try:
+    #     user = await db.user.upsert(
+    #         where={'email': user_profile.get('email')},
+    #         data={
+    #             'create': {
+    #                 'email': user_profile.get('email'),
+    #                 'name': user_profile.get('name'),
+    #                 'auth0_sub': user_profile.get('sub'),
+    #             },
+    #             'update': {
+    #                 'name': user_profile.get('name'),
+    #                 'auth0_sub': user_profile.get('sub'),
+    #             }
+    #         }
+    #     )
+    # except Exception as db_error:
+    #     print(f"Database error during user upsert: {db_error}")
+    #     # Decide if this should prevent login or just be logged
+    # ----------------------------------------------------
+
+    # Store user info in the session (Same as callback)
+    request.session["user"] = user_profile
+    request.session["id_token"] = id_token
+    # Decide if you need to store access/refresh tokens server-side
+
+    # No redirect needed, just return success (e.g., user profile)
+    # The session cookie is automatically set by the middleware
+    return {"message": "Login successful", "user": user_profile}
+
+
+# --- Redirect Login Endpoint (for social or fallback) ---
 @auth_router.get("/login")
 async def login(request: Request, user: dict | None = Depends(get_optional_current_user)):
     """
     Initiates the Auth0 login flow by redirecting the user to Auth0.
-    Generates state and PKCE parameters.
+    Generates state and PKCE parameters. Can be used for social logins.
     """
     if user:
         # Already logged in, redirect to frontend home or dashboard
@@ -101,6 +223,7 @@ async def login(request: Request, user: dict | None = Depends(get_optional_curre
         "client_id": settings.AUTH0_CLIENT_ID,
         "redirect_uri": settings.AUTH0_CALLBACK_URL,
         "scope": "openid profile email offline_access", # Request refresh token
+        "realm": "Username-Password-Authentication",
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
@@ -111,15 +234,18 @@ async def login(request: Request, user: dict | None = Depends(get_optional_curre
     return RedirectResponse(url=authorize_url)
 
 
+# --- Callback Endpoint (for redirect flow) ---
 @auth_router.get("/callback")
 async def callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None, error_description: str | None = None):
     """
-    Handles the callback from Auth0 after authentication.
+    Handles the callback from Auth0 after authentication via redirect.
     Exchanges the authorization code for tokens, validates the ID token,
     and stores user information in the session.
     """
     if error:
         print(f"Auth0 Error: {error} - {error_description}")
+        # Redirect back to frontend with error query params? Or show error page?
+        # Example redirect: return RedirectResponse(url=f"{settings.APP_BASE_URL}/login?error={error}&error_description={error_description}")
         raise HTTPException(status_code=400, detail=f"Auth0 error: {error_description or error}")
 
     stored_state = request.session.get("state")
@@ -173,36 +299,14 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
 
     # --- User Persistence (Optional but Recommended) ---
-    # Here you would typically use Prisma (or your ORM) to find or create the user
-    # based on user_profile['sub'] (Auth0 User ID) or user_profile['email']
-    # Example (requires Prisma setup):
-    # from app.prisma import db
-    # user = await db.user.upsert(
-    #     where={'email': user_profile.get('email')},
-    #     data={
-    #         'create': {
-    #             'email': user_profile.get('email'),
-    #             'name': user_profile.get('name', 'Unknown'),
-    #             'auth0_sub': user_profile.get('sub'), # Add auth0_sub field to schema
-    #             # Avoid storing passwords for Auth0 users
-    #         },
-    #         'update': {
-    #             'name': user_profile.get('name', 'Unknown'),
-    #             'auth0_sub': user_profile.get('sub'),
-    #         }
-    #     }
-    # )
+    # ... (add your Prisma upsert logic here if needed) ...
     # ----------------------------------------------------
 
     # Store user info and tokens in the session
-    # Be mindful of cookie size limits. Store only what's necessary.
-    # Avoid storing access/refresh tokens in the session cookie if possible,
-    # unless the frontend *truly* needs them (less common in BFF).
-    # If the backend needs to make API calls, manage tokens server-side.
     request.session["user"] = user_profile
-    request.session["id_token"] = id_token # Useful for user info display
-    # request.session["access_token"] = access_token # Store only if needed by frontend/backend calls initiated via frontend state
-    # request.session["refresh_token"] = refresh_token # Store securely (e.g., encrypted) if backend needs long-term access
+    request.session["id_token"] = id_token
+    # request.session["access_token"] = access_token
+    # request.session["refresh_token"] = refresh_token
 
     # Clear temporary PKCE/state data
     request.session.pop("state", None)
@@ -212,6 +316,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     return RedirectResponse(url=settings.APP_BASE_URL) # Or a specific post-login page
 
 
+# --- Logout Endpoint ---
 @auth_router.get("/logout")
 async def logout(request: Request):
     """Clears the local session and redirects the user to Auth0 logout."""
@@ -226,17 +331,16 @@ async def logout(request: Request):
         "client_id": settings.AUTH0_CLIENT_ID,
         "returnTo": settings.APP_BASE_URL # URL to return to after Auth0 logout
     }
-    # Starting from Auth0 SDK v2.0, use /v2/logout
-    # Check Auth0 documentation for the most current endpoint structure if needed.
     logout_url = f"https://{settings.AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
 
     return RedirectResponse(url=logout_url)
 
 
+# --- Get User Endpoint (Check Session) ---
 @auth_router.get("/me")
-async def get_me(user: dict = Depends(get_optional_current_user)):
-    """Simple endpoint to check the current user session."""
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+async def get_me(user: dict = Depends(get_current_user)): # Use get_current_user to enforce login
+    """Simple endpoint to check the current user session. Requires authentication."""
+    # No need for the if not user check, as get_current_user handles it
     return user
+
 

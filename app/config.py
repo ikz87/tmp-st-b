@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     SESSION_SECRET_KEY: str # Generate a strong random key for this
     APP_BASE_URL: str = "http://localhost:3000" # URL of your frontend app
 
+    ENVIRONMENT: str = "development"
+
     class Config:
         env_file = ".env"
         env_file_encoding = 'utf-8'
